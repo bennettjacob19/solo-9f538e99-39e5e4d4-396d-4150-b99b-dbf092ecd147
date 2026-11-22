@@ -1,4 +1,7 @@
 """API-level tests using FastAPI's TestClient."""
+import json
+from pathlib import Path
+
 import pytest
 
 pytest.importorskip("fastapi")
@@ -94,3 +97,74 @@ def test_precheck_invalid_cidr_returns_400():
 def test_precheck_schema_violation_returns_422():
     resp = client.post("/precheck", json={"source_cidr": "10.0.0.0/8"})
     assert resp.status_code == 422
+
+
+def test_precheck_reports_when_result_is_constant_but_basis_varies():
+    """A precheck that the old engine rejected as fragmented must now report.
+
+    The source space is split into 256 /24s, each matched by its own rule, and
+    'after' also splits the destination into 448 rerouted /24s.  The joint
+    partition would be ~115k rectangles (> the 100,000 cap the old engine
+    applied), but 'before' forwards identically everywhere: only its *basis*
+    changes with the source address, so a report is required.
+
+    The payload is the same one shipped in ``examples/should_report.json``.
+    """
+    payload = json.loads(
+        (Path(__file__).resolve().parent.parent / "examples" / "should_report.json")
+        .read_text()
+    )
+    resp = client.post("/precheck", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["summary"]["changed_pairs"] == "7516192768"
+    (g,) = body["groups"]
+    assert g["count"] == "7516192768"
+    assert g["example"] == {"source": "10.0.0.0", "destination": "192.0.0.0"}
+    assert g["before"] == {"type": "unicast", "dev": "eth0", "gateway": "192.0.2.1"}
+    assert g["after"] == {"type": "unicast", "dev": "eth1", "gateway": "203.0.113.1"}
+    # both bases belong to the same example pair (10.0.0.0 hits rule #0)
+    assert g["basis_before"]["rule_priority"] == 100
+    assert g["basis_before"]["table"] == "main"
+    assert g["basis_before"]["route_prefix"] == "0.0.0.0/0"
+    assert g["basis_after"]["rule_priority"] == 100
+    assert g["basis_after"]["table"] == "main"
+    assert g["basis_after"]["route_prefix"] == "192.0.0.0/24"
+
+
+def test_precheck_oversized_request_returns_400():
+    """A snapshot beyond the split bound is rejected as a whole."""
+    from app import routing
+
+    rules = [{"priority": 100, "src": "all", "table": "100"}]
+    routes = [
+        {"dst": f"0.0.0.{i}/32", "dev": "eth0", "table": "100"} for i in range(16)
+    ]
+    payload = {
+        "source_cidr": "10.0.0.1/32",
+        "destination_cidr": "0.0.0.0/28",
+        "before": {"rules": rules, "routes": routes},
+        "after": {"rules": rules, "routes": []},
+    }
+    original = routing.MAX_CELLS
+    routing.MAX_CELLS = 8
+    try:
+        resp = client.post("/precheck", json=payload)
+    finally:
+        routing.MAX_CELLS = original
+    assert resp.status_code == 400
+    assert "decision cells" in resp.json()["detail"]
+    assert "before snapshot" in resp.json()["detail"]
+
+
+def test_precheck_shipped_oversized_example_returns_400():
+    """The shipped must_400 payload exceeds the real (default) cell bound."""
+    payload = json.loads(
+        (Path(__file__).resolve().parent.parent / "examples" / "must_400.json")
+        .read_text()
+    )
+    resp = client.post("/precheck", json=payload)
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert "decision cells" in detail
+    assert "request" in detail

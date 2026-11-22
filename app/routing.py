@@ -20,6 +20,7 @@ so the cost depends on the policy size, not on the number of addresses.
 """
 from __future__ import annotations
 
+import bisect
 import ipaddress
 import json
 from dataclasses import dataclass
@@ -265,12 +266,36 @@ def result_json(result: Result) -> dict:
 
 # ---------------------------------------------------------------------------
 # symbolic decision over address rectangles
+#
+# The recursive splitter works on (start, prefixlen) integer pairs, which is
+# what keeps the cost proportional to the policy size rather than to the
+# number of addresses.  A rectangle is two such pairs; prefixes relate as
+# disjoint / superset / subset, so a rule or route either covers the whole
+# rectangle, misses it, or lies strictly inside it (forcing one split).
 # ---------------------------------------------------------------------------
 
-@dataclass
-class _Const:
+Rect = tuple[int, int]  # (network address as int, prefix length)
+
+
+def _as_rect(net: ipaddress.IPv4Network) -> Rect:
+    return int(net.network_address), net.prefixlen
+
+
+def _rect_contains(outer: Rect, inner: Rect) -> bool:
+    """True when ``inner`` is the same as or a subnet of ``outer``."""
+    if outer[1] > inner[1]:
+        return False
+    shift = 32 - outer[1]
+    return inner[0] >> shift == outer[0] >> shift
+
+
+@dataclass(frozen=True)
+class _Decision:
+    """One forwarding result plus the rule/route that produced it (if any)."""
+
     result: Result
-    basis: dict
+    rule: Optional[_PreparedRule] = None
+    route: Optional[Route] = None
 
 
 @dataclass
@@ -278,7 +303,34 @@ class _Split:
     dim: str  # "src" | "dst"
 
 
-def _basis(rule: Rule, route: Route) -> dict:
+@dataclass(frozen=True)
+class _PreparedRule:
+    """A rule with its selectors precomputed as integer rectangles."""
+
+    priority: int
+    src: Rect
+    dst: Rect
+    table: TableKey
+    table_display: str
+
+    @classmethod
+    def from_rule(cls, rule: Rule) -> "_PreparedRule":
+        return cls(
+            rule.priority,
+            _as_rect(rule.src),
+            _as_rect(rule.dst),
+            rule.table,
+            rule.table_display,
+        )
+
+
+def _basis(decision: _Decision) -> dict:
+    if decision.route is None:
+        return {
+            "route_type": "no_route",
+            "detail": "no usable route in any table selected by the rules",
+        }
+    rule, route = decision.rule, decision.route
     basis: dict[str, Any] = {
         "rule_priority": rule.priority,
         "table": rule.table_display,
@@ -291,98 +343,260 @@ def _basis(rule: Rule, route: Route) -> dict:
     return basis
 
 
-def _no_route_basis() -> dict:
-    return {
-        "route_type": "no_route",
-        "detail": "no usable route in any table selected by the rules",
-    }
+class _TableIndex:
+    """A routing table indexed for fast longest-prefix lookups on rectangles."""
+
+    __slots__ = ("by_prefixlen", "starts_by_prefixlen")
+
+    def __init__(self, routes: list[Route]) -> None:
+        # prefixlen -> {network address shifted to that prefixlen: route}
+        self.by_prefixlen: dict[int, dict[int, Route]] = {}
+        # prefixlen -> sorted full network addresses (for 'strictly inside' checks)
+        self.starts_by_prefixlen: dict[int, list[int]] = {}
+        for route in routes:
+            plen = route.prefix.prefixlen
+            start = int(route.prefix.network_address)
+            self.by_prefixlen.setdefault(plen, {})[start >> (32 - plen)] = route
+            self.starts_by_prefixlen.setdefault(plen, []).append(start)
+        for starts in self.starts_by_prefixlen.values():
+            starts.sort()
+
+    def covering(self, rect: Rect) -> Optional[Route]:
+        """The longest route prefix that covers the whole rectangle."""
+        start, plen = rect
+        for pl in range(plen, -1, -1):
+            route = self.by_prefixlen.get(pl, {}).get(start >> (32 - pl))
+            if route is not None:
+                return route
+        return None
+
+    def has_inner(self, rect: Rect) -> bool:
+        """True when a more-specific route lies strictly inside the rectangle."""
+        start, plen = rect
+        end = start + (1 << (32 - plen)) - 1
+        for inner_plen in range(plen + 1, 33):
+            starts = self.starts_by_prefixlen.get(inner_plen)
+            if not starts:
+                continue
+            idx = bisect.bisect_left(starts, start)
+            if idx < len(starts) and starts[idx] <= end:
+                return True
+        return False
+
+    def point(self, dst_ip: int) -> Optional[Route]:
+        """The longest route prefix containing a single destination address."""
+        for pl in range(32, -1, -1):
+            route = self.by_prefixlen.get(pl, {}).get(dst_ip >> (32 - pl))
+            if route is not None:
+                return route
+        return None
+
+
+def _lookup_rect(
+    dst: Rect, index: _TableIndex
+) -> Union[Optional[Route], _Split]:
+    """Longest-prefix lookup of a destination rectangle in one table.
+
+    Returns the covering route, ``None`` when the table has no covering route
+    and no more-specific route, or ``_Split('dst')`` when a more-specific
+    route lies strictly inside the rectangle (the answer then varies).
+    """
+    if index.has_inner(dst):
+        return _Split("dst")
+    return index.covering(dst)
 
 
 def _decide_rect(
-    src: ipaddress.IPv4Network,
-    dst: ipaddress.IPv4Network,
-    rules: list[Rule],
-    tables: dict[TableKey, list[Route]],
-) -> Union[_Const, _Split]:
+    src: Rect,
+    dst: Rect,
+    policy: Policy,
+    src_candidates: Optional[list[_PreparedRule]] = None,
+) -> Union[_Decision, _Split]:
     """Decide the fate of the whole rectangle ``src`` x ``dst``.
 
-    Returns ``_Const`` when every (source, destination) pair in the rectangle
-    shares one forwarding result, or ``_Split`` when the rectangle must be
-    subdivided along one dimension first.  Prefixes only ever relate as
-    disjoint / superset / subset, so a rule or route either covers the whole
-    rectangle, misses it, or lies strictly inside it (which forces a split).
+    Returns ``_Decision`` when every (source, destination) pair in the
+    rectangle shares one forwarding *result*, or ``_Split`` when the rectangle
+    must be subdivided along one dimension first.
+
+    ``src_candidates`` is an optional pre-filtered rule list (all rules whose
+    source selector can overlap ``src``); rules outside it cannot match and
+    are skipped.  The answer is the same either way.
+
+    The decision deliberately depends only on the result, not on which
+    rule/route produced it: two sub-rectangles that pick different tables but
+    forward identically are constant and need no split.
     """
-    for idx, rule in enumerate(rules):
-        if not src.overlaps(rule.src) or not dst.overlaps(rule.dst):
-            continue
-        if not src.subnet_of(rule.src):
-            return _Split("src")  # rule.src lies strictly inside src
-        if not dst.subnet_of(rule.dst):
-            return _Split("dst")  # rule.dst lies strictly inside dst
+    rules, tables = policy
+    for rule in src_candidates if src_candidates is not None else rules:
+        rule_src, rule_dst = rule.src, rule.dst
+        if not _rect_contains(rule_src, src):
+            if _rect_contains(src, rule_src):
+                return _Split("src")  # rule.src lies strictly inside src
+            continue  # disjoint: this rule cannot apply
+        if not _rect_contains(rule_dst, dst):
+            if _rect_contains(dst, rule_dst):
+                return _Split("dst")  # rule.dst lies strictly inside dst
+            continue  # destination misses the rule
         # The rule covers the whole rectangle: consult its table.
-        best: Optional[Route] = None
-        has_inner = False
-        for route in tables.get(rule.table, ()):
-            if dst.subnet_of(route.prefix):
-                # route.prefix covers the whole rectangle: longest prefix wins
-                if best is None or route.prefix.prefixlen > best.prefix.prefixlen:
-                    best = route
-            elif route.prefix.subnet_of(dst):
-                has_inner = True  # more-specific route strictly inside dst
-        if has_inner:
-            return _Split("dst")
+        index = tables.get(rule.table)
+        best = _lookup_rect(dst, index) if index is not None else None
+        if isinstance(best, _Split):
+            return best
         if best is None or best.rtype == "throw":
             continue  # no route or throw: keep consulting the next rules
         if best.rtype == "blackhole":
-            return _Const(BLACKHOLE, _basis(rule, best))
-        return _Const(Unicast(best.dev, best.gateway), _basis(rule, best))
-    return _Const(NO_ROUTE, _no_route_basis())
+            return _Decision(BLACKHOLE, rule, best)
+        return _Decision(Unicast(best.dev, best.gateway), rule, best)
+    return _Decision(NO_ROUTE)
 
 
-MAX_CELLS = 100_000  # safety bound against pathologically fragmented inputs
+def _decide_point(
+    src_ip: ipaddress.IPv4Address,
+    dst_ip: ipaddress.IPv4Address,
+    policy: Policy,
+) -> _Decision:
+    """Per-address lookup used to describe the example pair of a group."""
+    rules, tables = policy
+    src_int, dst_int = int(src_ip), int(dst_ip)
+    for rule in rules:
+        if (
+            _rect_contains(rule.src, (src_int, 32))
+            and _rect_contains(rule.dst, (dst_int, 32))
+        ):
+            best = tables.get(rule.table)
+            best = best.point(dst_int) if best is not None else None
+            if best is None or best.rtype == "throw":
+                continue
+            if best.rtype == "blackhole":
+                return _Decision(BLACKHOLE, rule, best)
+            return _Decision(Unicast(best.dev, best.gateway), rule, best)
+    return _Decision(NO_ROUTE)
 
 
-def _enumerate_cells(
+Policy = tuple[list[_PreparedRule], dict[TableKey, _TableIndex]]
+
+
+def _prepare_policy(rules: list[Rule], tables: dict[TableKey, list[Route]]) -> Policy:
+    return (
+        [_PreparedRule.from_rule(rule) for rule in rules],
+        {table: _TableIndex(routes) for table, routes in tables.items()},
+    )
+
+
+# Safety bound against pathologically fragmented inputs.  It applies per
+# snapshot as well as to the combined partition (see *_report_cells*).
+MAX_CELLS = 100_000
+
+Cell = tuple[Rect, Rect, tuple[Result, ...]]
+
+
+def _rect_overlaps(a: Rect, b: Rect) -> bool:
+    """True when two prefixes share at least one address."""
+    return _rect_contains(a, b) or _rect_contains(b, a)
+
+
+def _partition(
     src_net: ipaddress.IPv4Network,
     dst_net: ipaddress.IPv4Network,
-    before: tuple[list[Rule], dict[TableKey, list[Route]]],
-    after: tuple[list[Rule], dict[TableKey, list[Route]]],
-) -> list[tuple[ipaddress.IPv4Network, ipaddress.IPv4Network, _Const, _Const]]:
-    """Partition src_net x dst_net into rectangles where both snapshots are constant."""
-    rules_b, tables_b = before
-    rules_a, tables_a = after
-    cells: list[tuple[ipaddress.IPv4Network, ipaddress.IPv4Network, _Const, _Const]] = []
+    policies: list[Policy],
+    label: str,
+) -> list[Cell]:
+    """Partition src_net x dst_net into rectangles where each policy is constant.
 
-    def rec(s: ipaddress.IPv4Network, d: ipaddress.IPv4Network) -> None:
+    Returns ``(src_rect, dst_rect, results)`` tuples with one result per policy.
+    Each rectangle only considers rules whose source and destination selectors
+    can overlap it (everything else either misses or cannot split it), which
+    keeps the cost close to the number of cells times the number of rules that
+    actually act on each cell.  Raises :class:`UnsupportedInput` when the
+    partition needs more than ``MAX_CELLS`` rectangles.
+    """
+    cells: list[Cell] = []
+    limit_msg = (
+        f"{label} needs more than {MAX_CELLS} decision cells; narrow the CIDRs "
+        "or simplify the policy"
+    )
+    src_rect, dst_rect = _as_rect(src_net), _as_rect(dst_net)
+
+    def candidates(rules: list[_PreparedRule], s: Rect, d: Rect) -> list[_PreparedRule]:
+        return [
+            rule
+            for rule in rules
+            if _rect_overlaps(rule.src, s) and _rect_overlaps(rule.dst, d)
+        ]
+
+    def rec(s: Rect, d: Rect, active: list[list[_PreparedRule]]) -> None:
         if len(cells) >= MAX_CELLS:
-            raise UnsupportedInput(
-                f"address space is fragmented into more than {MAX_CELLS} decision "
-                "cells; narrow the CIDRs or simplify the policy"
-            )
-        db = _decide_rect(s, d, rules_b, tables_b)
-        da = _decide_rect(s, d, rules_a, tables_a)
-        if isinstance(db, _Const) and isinstance(da, _Const):
-            cells.append((s, d, db, da))
+            raise UnsupportedInput(limit_msg)
+        decisions = [
+            _decide_rect(s, d, policy, rules)
+            for policy, rules in zip(policies, active)
+        ]
+        if all(isinstance(dec, _Decision) for dec in decisions):
+            cells.append((s, d, tuple(dec.result for dec in decisions)))
             return
-        if any(isinstance(x, _Split) and x.dim == "src" for x in (db, da)):
-            if s.prefixlen == 32:  # pragma: no cover - unreachable by construction
+        if any(isinstance(dec, _Split) and dec.dim == "src" for dec in decisions):
+            if s[1] == 32:  # pragma: no cover - unreachable by construction
                 raise AssertionError("cannot split a /32 source prefix")
-            left, right = s.subnets()
-            rec(left, d)
-            rec(right, d)
+            half = 1 << (32 - s[1] - 1)
+            left, right = (s[0], s[1] + 1), (s[0] + half, s[1] + 1)
+            rec(left, d, [candidates(rules, left, d) for rules in active])
+            rec(right, d, [candidates(rules, right, d) for rules in active])
         else:
-            if d.prefixlen == 32:  # pragma: no cover - unreachable by construction
+            if d[1] == 32:  # pragma: no cover - unreachable by construction
                 raise AssertionError("cannot split a /32 destination prefix")
-            left, right = d.subnets()
-            rec(s, left)
-            rec(s, right)
+            half = 1 << (32 - d[1] - 1)
+            left, right = (d[0], d[1] + 1), (d[0] + half, d[1] + 1)
+            rec(s, left, [candidates(rules, s, left) for rules in active])
+            rec(s, right, [candidates(rules, s, right) for rules in active])
 
-    rec(src_net, dst_net)
+    rec(
+        src_rect,
+        dst_rect,
+        [
+            candidates(policy[0], src_rect, dst_rect)
+            for policy in policies
+        ],
+    )
     return cells
 
 
-def _addr_count(net: ipaddress.IPv4Network) -> int:
-    return 1 << (32 - net.prefixlen)
+def _report_cells(
+    src_net: ipaddress.IPv4Network,
+    dst_net: ipaddress.IPv4Network,
+    before: Policy,
+    after: Policy,
+) -> list[tuple[Rect, Rect, Result, Result]]:
+    """Rectangles where both snapshots are constant, ready to be counted.
+
+    Each snapshot is first partitioned on its own, which also proves (or
+    disproves) that it forwards identically over the whole query range.  If at
+    least one snapshot is constant, the other snapshot's partition is already
+    a valid joint partition, so the joint fragmentation can never exceed the
+    per-snapshot bound even when the selection *basis* varies with the source
+    or destination address.  Only when both snapshots vary is the joint
+    partition needed, and it is still bound by ``MAX_CELLS``.
+    """
+    before_cells = _partition(src_net, dst_net, [before], "before snapshot")
+    after_cells = _partition(src_net, dst_net, [after], "after snapshot")
+
+    before_results = {results[0] for _, _, results in before_cells}
+    after_results = {results[0] for _, _, results in after_cells}
+
+    if len(before_results) == 1:
+        # 'before' is uniform: partition by 'after' alone.
+        constant = next(iter(before_results))
+        return [(s, d, constant, results[0]) for s, d, results in after_cells]
+    if len(after_results) == 1:
+        # 'after' is uniform: partition by 'before' alone.
+        constant = next(iter(after_results))
+        return [(s, d, results[0], constant) for s, d, results in before_cells]
+
+    joint = _partition(src_net, dst_net, [before, after], "request")
+    return [(s, d, results[0], results[1]) for s, d, results in joint]
+
+
+def _rect_size(rect: Rect) -> int:
+    return 1 << (32 - rect[1])
 
 
 # ---------------------------------------------------------------------------
@@ -405,39 +619,61 @@ def run_precheck(
     """
     src_net = parse_prefix(source_cidr, "source_cidr")
     dst_net = parse_prefix(destination_cidr, "destination_cidr")
-    before = (parse_rules(before_rules, "before"), parse_routes(before_routes, "before"))
-    after = (parse_rules(after_rules, "after"), parse_routes(after_routes, "after"))
+    before = _prepare_policy(
+        parse_rules(before_rules, "before"), parse_routes(before_routes, "before")
+    )
+    after = _prepare_policy(
+        parse_rules(after_rules, "after"), parse_routes(after_routes, "after")
+    )
 
-    cells = _enumerate_cells(src_net, dst_net, before, after)
+    cells = _report_cells(src_net, dst_net, before, after)
 
-    total = _addr_count(src_net) * _addr_count(dst_net)
+    total = _rect_size(_as_rect(src_net)) * _rect_size(_as_rect(dst_net))
     changed = 0
-    groups: dict[tuple[Result, Result], dict] = {}
-    for s, d, db, da in cells:
-        if db.result == da.result:
+    groups: dict[tuple[Result, Result], int] = {}
+    first_cell: dict[tuple[Result, Result], Rect] = {}
+    for s, d, result_b, result_a in cells:
+        count = _rect_size(s) * _rect_size(d)
+        if result_b == result_a:
             continue
-        count = _addr_count(s) * _addr_count(d)
-        key = (db.result, da.result)
-        group = groups.get(key)
-        if group is None:
-            group = groups[key] = {
-                "count": 0,
-                "example": {
-                    "source": str(s.network_address),
-                    "destination": str(d.network_address),
-                },
-                "basis_before": db.basis,
-                "basis_after": da.basis,
-            }
-        group["count"] += count
         changed += count
+        key = (result_b, result_a)
+        groups[key] = groups.get(key, 0) + count
+        if key not in first_cell:
+            first_cell[key] = s[0], d[0]  # representative (src start, dst start)
 
     ordered = sorted(
-        groups.items(),
+        groups,
         key=lambda kv: json.dumps(
-            [result_json(kv[0][0]), result_json(kv[0][1])], sort_keys=True
+            [result_json(kv[0]), result_json(kv[1])], sort_keys=True
         ),
     )
+    report_groups = []
+    for key in ordered:
+        # One example pair for both sides: the per-address lookup on this pair
+        # must reproduce this group's before *and* after result, so both
+        # reported bases describe the same address pair.
+        src_int, dst_int = first_cell[key]
+        src_ip, dst_ip = ipaddress.IPv4Address(src_int), ipaddress.IPv4Address(dst_int)
+        example = {"source": str(src_ip), "destination": str(dst_ip)}
+        decision_b = _decide_point(src_ip, dst_ip, before)
+        decision_a = _decide_point(src_ip, dst_ip, after)
+        if (decision_b.result, decision_a.result) != key:
+            # The cell start is a valid address of the cell, so this cannot
+            # happen; guard anyway rather than report a foreign basis.
+            raise AssertionError("example pair does not reproduce its group")
+        basis_b, basis_a = _basis(decision_b), _basis(decision_a)
+        report_groups.append(
+            {
+                "before": result_json(key[0]),
+                "after": result_json(key[1]),
+                "count": str(groups[key]),
+                "example": example,
+                "basis_before": basis_b,
+                "basis_after": basis_a,
+            }
+        )
+
     return {
         "summary": {
             "source_cidr": str(src_net),
@@ -445,17 +681,7 @@ def run_precheck(
             "total_pairs": str(total),
             "changed_pairs": str(changed),
             "unchanged_pairs": str(total - changed),
-            "group_count": len(ordered),
+            "group_count": len(report_groups),
         },
-        "groups": [
-            {
-                "before": result_json(key[0]),
-                "after": result_json(key[1]),
-                "count": str(group["count"]),
-                "example": group["example"],
-                "basis_before": group["basis_before"],
-                "basis_after": group["basis_after"],
-            }
-            for key, group in ordered
-        ],
+        "groups": report_groups,
     }
