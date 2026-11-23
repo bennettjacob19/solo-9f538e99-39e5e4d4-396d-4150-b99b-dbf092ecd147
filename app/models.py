@@ -48,7 +48,85 @@ _EXAMPLE_ROUTES_AFTER = [
 ]
 
 
+def _per_source_rules(table_for) -> list:
+    """320 lookup rules carving 10.0.0.0/8 into /17s (fragmentation demos)."""
+    rules = [{"priority": 0, "src": "all", "table": "local"}]
+    for i in range(320):
+        rules.append({
+            "priority": 1000 + i,
+            "src": f"10.{i >> 1}.{128 * (i & 1)}.0/17",
+            "table": table_for(i),
+        })
+    rules.append({"priority": 32766, "src": "all", "table": "main"})
+    return rules
+
+
+# 320 blackholed destinations: 172.16.0.0/24 .. 172.17.63.0/24
+_BLACKHOLED = [f"172.{16 + (i >> 8)}.{i & 255}.0/24" for i in range(320)]
+
+# Shared 'after' snapshot for the two fragmentation demos: the per-source
+# rules are consolidated away and a few destinations are blackholed in main.
+_AFTER_CONSOLIDATED = {
+    "rules": [
+        {"priority": 0, "src": "all", "table": "local"},
+        {"priority": 32766, "src": "all", "table": "main"},
+    ],
+    "routes": [
+        {"dst": "default", "gateway": "198.51.100.1", "dev": "eth1", "table": "main"},
+        *(
+            {"dst": prefix, "type": "blackhole", "table": "main"}
+            for prefix in _BLACKHOLED
+        ),
+    ],
+}
+
+# Example 2: before the change, 320 per-source rules hit different policies
+# but all resolve to the same egress (eth1 via 198.51.100.1); after the
+# change the rules are consolidated and 320 destinations are blackholed.
+# The joint address-space split would exceed the decision-cell limit, but
+# each snapshot alone fits and the 'before' snapshot keeps a single
+# forwarding result, so a full report is still produced.
+_FRAGMENTED_CONSTANT_EXAMPLE = {
+    "source_cidr": "0.0.0.0/0",
+    "destination_cidr": "0.0.0.0/0",
+    "before": {
+        "rules": _per_source_rules(lambda i: "100"),
+        "routes": [
+            {"dst": "default", "gateway": "198.51.100.1", "dev": "eth1", "table": "100"},
+            {"dst": "default", "gateway": "198.51.100.1", "dev": "eth1", "table": "main"},
+        ],
+    },
+    "after": _AFTER_CONSOLIDATED,
+}
+
+# Example 3: same shape, but the 'before' snapshot alternates between two
+# egresses, so neither snapshot keeps a single forwarding result over the
+# query range and the joint split exceeds the decision-cell limit -> HTTP 400.
+_OVER_LIMIT_EXAMPLE = {
+    "source_cidr": "0.0.0.0/0",
+    "destination_cidr": "0.0.0.0/0",
+    "before": {
+        "rules": _per_source_rules(lambda i: "100" if i % 2 == 0 else "200"),
+        "routes": [
+            {"dst": "default", "gateway": "198.51.100.1", "dev": "eth1", "table": "100"},
+            {"dst": "default", "gateway": "203.0.113.1", "dev": "eth2", "table": "200"},
+            {"dst": "default", "gateway": "198.51.100.1", "dev": "eth1", "table": "main"},
+        ],
+    },
+    "after": _AFTER_CONSOLIDATED,
+}
+
+
 class PrecheckRequest(BaseModel):
+    """Precheck request.
+
+    The Swagger UI example dropdown offers three ready-to-run payloads:
+    (1) a small dual-egress change; (2) a fragmented 'before' snapshot whose
+    per-source rules all resolve to the same egress — a full report is still
+    produced; (3) both snapshots fragmented with no constant side — the
+    request exceeds the decision-cell limit and is rejected with HTTP 400.
+    """
+
     source_cidr: str = Field(
         ..., description="Source IPv4 CIDR, e.g. `10.0.0.0/8`; `0.0.0.0/0` is allowed"
     )
@@ -72,7 +150,9 @@ class PrecheckRequest(BaseModel):
                         "rules": _EXAMPLE_RULES,
                         "routes": _EXAMPLE_ROUTES_AFTER,
                     },
-                }
+                },
+                _FRAGMENTED_CONSTANT_EXAMPLE,
+                _OVER_LIMIT_EXAMPLE,
             ]
         }
     }

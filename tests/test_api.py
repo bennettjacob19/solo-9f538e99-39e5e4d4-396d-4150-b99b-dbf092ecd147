@@ -94,3 +94,52 @@ def test_precheck_invalid_cidr_returns_400():
 def test_precheck_schema_violation_returns_422():
     resp = client.post("/precheck", json={"source_cidr": "10.0.0.0/8"})
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# the ready-to-run /docs example payloads
+# ---------------------------------------------------------------------------
+
+def docs_examples():
+    from app.models import PrecheckRequest
+
+    return PrecheckRequest.model_config["json_schema_extra"]["examples"]
+
+
+def test_docs_default_example_returns_report():
+    resp = client.post("/precheck", json=docs_examples()[0])
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["summary"]["group_count"] == 2
+
+
+def test_docs_fragmented_example_returns_report():
+    """320 per-source rules, one egress; 320 rerouted destinations: the joint
+    split would exceed 100k cells, but the 'before' snapshot is constant."""
+    resp = client.post("/precheck", json=docs_examples()[1])
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["summary"]["total_pairs"] == str(2**64)
+    assert body["summary"]["group_count"] == 1
+    (g,) = body["groups"]
+    assert g["before"] == {"type": "unicast", "dev": "eth1", "gateway": "198.51.100.1"}
+    assert g["after"] == {"type": "blackhole", "dev": None, "gateway": None}
+    assert g["count"] == str(2**32 * 320 * 256)
+    assert int(body["summary"]["changed_pairs"]) == 2**32 * 320 * 256
+    assert (
+        int(body["summary"]["changed_pairs"]) + int(body["summary"]["unchanged_pairs"])
+        == 2**64
+    )
+    # both bases describe the example pair: source 0.0.0.0 falls through to the
+    # main table, destination 172.16.0.0 hits the first blackholed /24
+    assert g["example"] == {"source": "0.0.0.0", "destination": "172.16.0.0"}
+    assert g["basis_before"]["table"] == "main"
+    assert g["basis_before"]["route_type"] == "unicast"
+    assert g["basis_after"]["route_prefix"] == "172.16.0.0/24"
+    assert g["basis_after"]["route_type"] == "blackhole"
+
+
+def test_docs_over_limit_example_returns_400():
+    """Both snapshots fragmented, neither constant: exceeds the cell limit."""
+    resp = client.post("/precheck", json=docs_examples()[2])
+    assert resp.status_code == 400
+    assert "fragmented" in resp.json()["detail"]

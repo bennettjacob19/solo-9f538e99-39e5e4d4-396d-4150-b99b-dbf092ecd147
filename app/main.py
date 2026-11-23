@@ -9,7 +9,7 @@ from .models import PrecheckRequest, PrecheckResponse
 
 app = FastAPI(
     title="Dual-Egress Routing Precheck",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Counts how many (source, destination) address pairs change their "
         "forwarding result between two Linux IPv4 policy-routing snapshots. "
@@ -17,7 +17,12 @@ app = FastAPI(
         "`ip -j -4 route show table all` (before and after the planned change) "
         "plus a source and destination IPv4 CIDR. The local table and rules "
         "pointing to it are ignored; computation is symbolic, so `/0` CIDRs "
-        "are cheap. Unsupported features (multipath, fwmark selectors, "
+        "are cheap. Each snapshot must partition the query range into at "
+        "most 100,000 decision cells; when one snapshot keeps a single "
+        "forwarding result over the whole range, the report is derived from "
+        "the other snapshot's partition alone (the constant side's routing "
+        "basis is evaluated at each group's example pair). Unsupported "
+        "features (multipath, fwmark selectors, "
         "non-unicast/throw/blackhole routes, ...) are rejected with HTTP 400."
     ),
 )

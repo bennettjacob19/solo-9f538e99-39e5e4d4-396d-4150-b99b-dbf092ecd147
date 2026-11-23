@@ -3,6 +3,7 @@ import ipaddress
 
 import pytest
 
+from app import routing
 from app.routing import UnsupportedInput, parse_routes, parse_rules, run_precheck
 
 LOCAL_RULE = {"priority": 0, "src": "all", "table": "local"}
@@ -433,6 +434,15 @@ def test_symbolic_engine_matches_bruteforce():
                 if value[0] == "unicast":
                     assert basis["dev"] == value[1]
                     assert basis["gateway"] == value[2]
+            # both bases must describe the advertised example pair exactly
+            assert (
+                routing._decide_point(int(es), int(ed), rules_b, tables_b).basis
+                == g["basis_before"]
+            )
+            assert (
+                routing._decide_point(int(es), int(ed), rules_a, tables_a).basis
+                == g["basis_after"]
+            )
 
         assert got == expected
         assert int(res["summary"]["changed_pairs"]) == sum(expected.values())
@@ -441,3 +451,310 @@ def test_symbolic_engine_matches_bruteforce():
             int(res["summary"]["changed_pairs"]) + int(res["summary"]["unchanged_pairs"])
             == 64 * 64
         )
+
+
+# ---------------------------------------------------------------------------
+# fragmented inputs: each snapshot fits the cell limit on its own
+# ---------------------------------------------------------------------------
+
+def carved_src_rules(count=16, table_for=lambda i: "100"):
+    """Per-/28 source rules tiling 10.0.0.0/24 (a fragmented rule set)."""
+    return [LOCAL_RULE] + [
+        {"priority": 1000 + i, "src": f"10.0.0.{16 * i}/28", "table": table_for(i)}
+        for i in range(count)
+    ] + [MAIN_RULE]
+
+
+def blackholed_dests(count, table="main"):
+    """Blackhole routes tiling 192.0.2.0/24 in /28 steps."""
+    return [
+        {"dst": f"192.0.2.{16 * i}/28", "type": "blackhole", "table": table}
+        for i in range(count)
+    ]
+
+
+def check_against_bruteforce(res, src_net, dst_net, rules_b, tables_b, rules_a, tables_a):
+    """Compare a precheck report against the per-address oracle."""
+    expected = {}
+    for s in src_net:
+        for d in dst_net:
+            vb = brute_lookup(s, d, rules_b, tables_b)
+            va = brute_lookup(s, d, rules_a, tables_a)
+            if vb != va:
+                expected[(vb, va)] = expected.get((vb, va), 0) + 1
+    got = {}
+    for g in res["groups"]:
+        key = (result_tuple(g["before"]), result_tuple(g["after"]))
+        assert key not in got  # one group per (before, after) combination
+        got[key] = int(g["count"])
+        es = ipaddress.IPv4Address(g["example"]["source"])
+        ed = ipaddress.IPv4Address(g["example"]["destination"])
+        # the advertised example pair must really belong to this group
+        assert brute_lookup(es, ed, rules_b, tables_b) == key[0]
+        assert brute_lookup(es, ed, rules_a, tables_a) == key[1]
+        # the basis on each side must describe that same example pair
+        assert (
+            routing._decide_point(int(es), int(ed), rules_b, tables_b).basis
+            == g["basis_before"]
+        )
+        assert (
+            routing._decide_point(int(es), int(ed), rules_a, tables_a).basis
+            == g["basis_after"]
+        )
+    assert got == expected
+    assert int(res["summary"]["changed_pairs"]) == sum(expected.values())
+    assert (
+        int(res["summary"]["changed_pairs"]) + int(res["summary"]["unchanged_pairs"])
+        == int(res["summary"]["total_pairs"])
+    )
+
+
+def test_fragmented_constant_before_still_reports(monkeypatch):
+    """Before: many per-source rules, one forwarding result; after: a few
+    blackholed destinations.  The joint refinement would exceed the cell
+    limit, but each snapshot alone fits and 'before' is constant."""
+    monkeypatch.setattr(routing, "MAX_CELLS", 100)
+    rules_b = carved_src_rules()
+    routes_b = [
+        {"dst": "default", "gateway": "198.51.100.1", "dev": "eth1", "table": "100"},
+        {"dst": "default", "gateway": "198.51.100.1", "dev": "eth1", "table": "main"},
+    ]
+    rules_a = [LOCAL_RULE, MAIN_RULE]
+    routes_a = [
+        {"dst": "default", "gateway": "198.51.100.1", "dev": "eth1", "table": "main"},
+        *blackholed_dests(8),
+    ]
+    res = run_precheck(
+        "10.0.0.0/24", "192.0.2.0/24", rules_b, routes_b, rules_a, routes_a
+    )
+    (g,) = res["groups"]
+    assert g["before"] == {"type": "unicast", "dev": "eth1", "gateway": "198.51.100.1"}
+    assert g["after"] == {"type": "blackhole"}
+    assert g["count"] == str(256 * 8 * 16)
+    # the constant side's basis corresponds to the example pair: source
+    # 10.0.0.0 hits the first per-/28 rule, destination 192.0.2.0/28 is dropped
+    assert g["example"] == {"source": "10.0.0.0", "destination": "192.0.2.0"}
+    assert g["basis_before"]["rule_priority"] == 1000
+    assert g["basis_before"]["table"] == "100"
+    assert g["basis_after"]["route_prefix"] == "192.0.2.0/28"
+    assert g["basis_after"]["route_type"] == "blackhole"
+    check_against_bruteforce(
+        res,
+        ipaddress.IPv4Network("10.0.0.0/24"),
+        ipaddress.IPv4Network("192.0.2.0/24"),
+        parse_rules(rules_b, "before"), parse_routes(routes_b, "before"),
+        parse_rules(rules_a, "after"), parse_routes(routes_a, "after"),
+    )
+
+
+def test_fragmented_constant_after_still_reports(monkeypatch):
+    """Mirror image: 'after' is the constant side this time."""
+    monkeypatch.setattr(routing, "MAX_CELLS", 100)
+    rules_b = [LOCAL_RULE, MAIN_RULE]
+    routes_b = [
+        {"dst": "default", "gateway": "198.51.100.1", "dev": "eth1", "table": "main"},
+        *blackholed_dests(8),
+    ]
+    rules_a = carved_src_rules()
+    routes_a = [
+        {"dst": "default", "gateway": "198.51.100.1", "dev": "eth1", "table": "100"},
+        {"dst": "default", "gateway": "198.51.100.1", "dev": "eth1", "table": "main"},
+    ]
+    res = run_precheck(
+        "10.0.0.0/24", "192.0.2.0/24", rules_b, routes_b, rules_a, routes_a
+    )
+    (g,) = res["groups"]
+    assert g["before"] == {"type": "blackhole"}
+    assert g["after"] == {"type": "unicast", "dev": "eth1", "gateway": "198.51.100.1"}
+    assert g["count"] == str(256 * 8 * 16)
+    assert g["basis_before"]["route_prefix"] == "192.0.2.0/28"
+    assert g["basis_after"]["table"] == "100"
+    check_against_bruteforce(
+        res,
+        ipaddress.IPv4Network("10.0.0.0/24"),
+        ipaddress.IPv4Network("192.0.2.0/24"),
+        parse_rules(rules_b, "before"), parse_routes(routes_b, "before"),
+        parse_rules(rules_a, "after"), parse_routes(routes_a, "after"),
+    )
+
+
+def test_fragmented_both_sides_constant(monkeypatch):
+    """Both snapshots are fragmented yet constant: one group, total count."""
+    monkeypatch.setattr(routing, "MAX_CELLS", 100)
+    rules_b = carved_src_rules()
+    routes_b = [
+        {"dst": "default", "gateway": "198.51.100.1", "dev": "eth1", "table": "100"},
+        {"dst": "default", "gateway": "198.51.100.1", "dev": "eth1", "table": "main"},
+    ]
+    rules_a = [LOCAL_RULE, MAIN_RULE]
+    routes_a = [
+        {"dst": "default", "gateway": "203.0.113.1", "dev": "eth2", "table": "main"},
+        *(
+            {"dst": f"192.0.2.{16 * i}/28", "gateway": "203.0.113.1",
+             "dev": "eth2", "table": "main"}
+            for i in range(8)
+        ),
+    ]
+    res = run_precheck(
+        "10.0.0.0/24", "192.0.2.0/24", rules_b, routes_b, rules_a, routes_a
+    )
+    (g,) = res["groups"]
+    assert g["before"] == {"type": "unicast", "dev": "eth1", "gateway": "198.51.100.1"}
+    assert g["after"] == {"type": "unicast", "dev": "eth2", "gateway": "203.0.113.1"}
+    assert g["count"] == str(256 * 256)
+    assert res["summary"]["changed_pairs"] == str(256 * 256)
+    check_against_bruteforce(
+        res,
+        ipaddress.IPv4Network("10.0.0.0/24"),
+        ipaddress.IPv4Network("192.0.2.0/24"),
+        parse_rules(rules_b, "before"), parse_routes(routes_b, "before"),
+        parse_rules(rules_a, "after"), parse_routes(routes_a, "after"),
+    )
+
+
+def test_fragmented_neither_side_constant_rejected(monkeypatch):
+    """Each snapshot fits on its own, both vary, joint refinement too big."""
+    monkeypatch.setattr(routing, "MAX_CELLS", 100)
+    rules_b = carved_src_rules(table_for=lambda i: "100" if i % 2 == 0 else "200")
+    routes_b = [
+        {"dst": "default", "gateway": "198.51.100.1", "dev": "eth1", "table": "100"},
+        {"dst": "default", "gateway": "203.0.113.1", "dev": "eth2", "table": "200"},
+        {"dst": "default", "gateway": "198.51.100.1", "dev": "eth1", "table": "main"},
+    ]
+    rules_a = [LOCAL_RULE, MAIN_RULE]
+    routes_a = [
+        {"dst": "default", "gateway": "198.51.100.1", "dev": "eth1", "table": "main"},
+        *blackholed_dests(8),
+    ]
+    with pytest.raises(UnsupportedInput, match="fragmented"):
+        run_precheck("10.0.0.0/24", "192.0.2.0/24", rules_b, routes_b, rules_a, routes_a)
+
+
+def test_snapshot_beyond_cell_limit_rejected(monkeypatch):
+    """The 'after' snapshot alone needs 16 x 9 = 144 cells > 100: reject."""
+    monkeypatch.setattr(routing, "MAX_CELLS", 100)
+    rules = carved_src_rules()
+    routes_b = [
+        {"dst": "default", "gateway": "198.51.100.1", "dev": "eth1", "table": "100"},
+        {"dst": "default", "gateway": "198.51.100.1", "dev": "eth1", "table": "main"},
+    ]
+    routes_a = routes_b + blackholed_dests(8, table="100")
+    with pytest.raises(UnsupportedInput, match="fragmented"):
+        run_precheck("10.0.0.0/24", "192.0.2.0/24", rules, routes_b, rules, routes_a)
+
+
+def test_joint_refinement_tree_fallback(monkeypatch):
+    """Intersection pair-check budget exhausted -> recursive splitting is used."""
+    monkeypatch.setattr(routing, "MAX_CELLS", 1000)
+    monkeypatch.setattr(routing, "_MAX_INTERSECTION_CHECKS", 10)
+    rules_b = carved_src_rules(table_for=lambda i: "100" if i % 2 == 0 else "200")
+    routes_b = [
+        {"dst": "default", "gateway": "198.51.100.1", "dev": "eth1", "table": "100"},
+        {"dst": "default", "gateway": "203.0.113.1", "dev": "eth2", "table": "200"},
+        {"dst": "default", "gateway": "198.51.100.1", "dev": "eth1", "table": "main"},
+    ]
+    rules_a = [LOCAL_RULE, MAIN_RULE]
+    routes_a = [
+        {"dst": "default", "gateway": "198.51.100.1", "dev": "eth1", "table": "main"},
+        *blackholed_dests(8),
+    ]
+    # joint refinement = 16 src x 9 dst = 144 cells <= 1000: report via tree
+    res = run_precheck(
+        "10.0.0.0/24", "192.0.2.0/24", rules_b, routes_b, rules_a, routes_a
+    )
+    check_against_bruteforce(
+        res,
+        ipaddress.IPv4Network("10.0.0.0/24"),
+        ipaddress.IPv4Network("192.0.2.0/24"),
+        parse_rules(rules_b, "before"), parse_routes(routes_b, "before"),
+        parse_rules(rules_a, "after"), parse_routes(routes_a, "after"),
+    )
+
+
+def fits_with_constant_side(src_net, dst_net, rules_b, tables_b, rules_a, tables_a):
+    """Would run_precheck accept this input via the constant-side path?"""
+    own_cells = []
+    for rules, tables in ((rules_b, tables_b), (rules_a, tables_a)):
+        try:
+            own = routing._enumerate_cells(
+                src_net, dst_net, ((rules, tables),), "test"
+            )
+        except UnsupportedInput:
+            return False
+        own_cells.append(own)
+    return any(
+        len({decided[0].result for *_, decided in cells}) == 1 for cells in own_cells
+    )
+
+
+def fragmenting_policy(rng, tables=("main", "100", "200")):
+    """Random policy whose selectors/prefixes fragment the 64x64 query range."""
+    src_prefixes = ["10.0.0.0/28", "10.0.0.16/28", "10.0.0.32/28", "10.0.0.48/28"]
+    dst_prefixes = ["192.0.2.0/28", "192.0.2.16/28", "192.0.2.32/28", "192.0.2.48/28"]
+    rules = [dict(LOCAL_RULE)]
+    for prio in sorted(rng.sample(range(100, 1000, 100), k=rng.randint(1, 4))):
+        rule = {"priority": prio, "table": rng.choice(tables)}
+        if rng.random() < 0.7:
+            rule["src"] = rng.choice(src_prefixes + ["all"])
+        if rng.random() < 0.3:
+            rule["dst"] = rng.choice(dst_prefixes)
+        rules.append(rule)
+    routes = [
+        # local table noise that must be ignored
+        {"dst": "0.0.0.0/0", "type": "blackhole", "table": "local"},
+        {"dst": "192.0.2.0/28", "type": "blackhole", "table": "local"},
+    ]
+    used = set()
+    for table in tables:
+        for _ in range(rng.randint(0, 4)):
+            prefix = rng.choice(["0.0.0.0/0", *dst_prefixes])
+            if (table, prefix) in used:
+                continue
+            used.add((table, prefix))
+            kind = rng.random()
+            if kind < 0.6:
+                route = {"dst": prefix, "table": table,
+                         "dev": rng.choice(["eth0", "eth1"])}
+                gw = rng.choice([None, "203.0.113.1", "203.0.113.2"])
+                if gw is not None:
+                    route["gateway"] = gw
+                routes.append(route)
+            elif kind < 0.8:
+                routes.append({"dst": prefix, "table": table, "type": "throw"})
+            else:
+                routes.append({"dst": prefix, "table": table, "type": "blackhole"})
+    return rules, routes
+
+
+def test_randomized_tiny_cell_limit_matches_bruteforce(monkeypatch):
+    """With a tiny cell limit the constant-side path and the joint refinement
+    are exercised: accepted inputs must match the oracle, rejected ones must
+    be genuinely over the limit."""
+    rng = __import__("random").Random(20261122)
+    monkeypatch.setattr(routing, "MAX_CELLS", 12)
+    monkeypatch.setattr(routing, "_MAX_INTERSECTION_CHECKS", 64)
+    src_net = ipaddress.IPv4Network("10.0.0.0/26")
+    dst_net = ipaddress.IPv4Network("192.0.2.0/26")
+    accepted = rejected = 0
+    for _ in range(80):
+        rules_b_raw, routes_b = fragmenting_policy(rng)
+        rules_a_raw, routes_a = fragmenting_policy(rng)
+        rules_b, tables_b = parse_rules(rules_b_raw, "before"), parse_routes(routes_b, "before")
+        rules_a, tables_a = parse_rules(rules_a_raw, "after"), parse_routes(routes_a, "after")
+        try:
+            res = run_precheck(
+                str(src_net), str(dst_net), rules_b_raw, routes_b, rules_a_raw, routes_a
+            )
+        except UnsupportedInput:
+            rejected += 1
+            # genuinely over the limit: a snapshot needs too many cells on its
+            # own, or neither snapshot is constant over the query range
+            assert not fits_with_constant_side(
+                src_net, dst_net, rules_b, tables_b, rules_a, tables_a
+            )
+            continue
+        accepted += 1
+        check_against_bruteforce(
+            res, src_net, dst_net, rules_b, tables_b, rules_a, tables_a
+        )
+    assert accepted > 0 and rejected > 0  # both paths actually exercised
